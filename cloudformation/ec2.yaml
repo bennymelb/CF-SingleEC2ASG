@@ -1,0 +1,169 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'This is a Sample template for creating a self heal single EC2 instance'
+
+Parameters:
+  AmiId:
+    Description: The Id of the ami we are going to use
+    Type: AWS::EC2::Image::Id
+  VpcId:
+    Description: The Id of the VPC we are going to deploy to
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Description: The Id of the subnet we are going to deploy to
+    Type: List<AWS::EC2::Subnet::Id>
+  EC2KeyPair:
+    Description: The Key Pair for ssh into this EC2
+    Type: AWS::EC2::KeyPair::KeyName
+  KMSKeyId:
+    Description: The ID of KMS key this EC2 instance is allowed to use for decrypting password
+    Type: String
+  Environment:
+    Description: The environment of this EC2 instance
+    Type: String
+    AllowedValues: [dev,test,prod]
+  AppName:
+    Description: The name the application where this EC2 belongs to
+    Type: String
+  InstanceName:
+    Description: The name of this EC2 instance
+    Type: String
+  R53Zone:
+    Description: The route53 zone ID where we are creating the dns record for our EC2 instance
+    Type: AWS::Route53::HostedZone::Id
+  Patching:
+    Description: Set this to start for ASG to change the max and desired capacity to 2 so it spin up a new instance, set this to finish for ASG to change the max and desired capacity to 1 so it kill the old instance.
+    Type: String
+    AllowedValues: [start,finish,rollback]
+  LaunchTemplateRollbackVersion:
+    Description: The version of the launch template for the rollback to deploy
+    Type: String
+
+Conditions:
+  IsPatching: !Equals [ !Ref Patching, start ]
+  NotPatching: !Equals [ !Ref Patching, finish ] 
+  IsRollback: !Equals [ !Ref Patching, rollback ]
+  ASGScaleOut: !Or [ Condition: IsPatching , Condition: IsRollback ]
+
+Resources:
+  EC2SG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${Environment}-${AppName}-${InstanceName}-SecurityGroup'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+        Description: SSH port
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+        Description: WebServer Port
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: !Sub '/${Environment}/${AppName}/'
+      Policies:
+        -
+          PolicyName: !Sub '${Environment}-${AppName}-IAM-Policy'
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: "kms:Decrypt"
+                Resource: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/${KMSKeyId}'
+              - 
+                Effect: "Allow"
+                Action: "ssm:GetParameter"
+                Resource: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:parameter/${Environment}/${AppName}/*'
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: !Sub '/${Environment}/${AppName}/'
+      Roles:
+        - !Ref EC2Role
+      InstanceProfileName: !Sub '${Environment}-${AppName}-IAM-InstanceProfile'
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${Environment}-${AppName}-EC2LaunchTemplate'
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: "/dev/xvda"
+            Ebs: 
+              VolumeType: gp2
+              VolumeSize: 20
+              DeleteOnTermination: True
+        CreditSpecification:
+          CpuCredits: unlimited
+        DisableApiTermination: false
+        EbsOptimized: true
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        ImageId: !Ref AmiId
+        InstanceType: t3.micro
+        KeyName: !Ref EC2KeyPair
+        Monitoring:
+          Enabled: True
+        SecurityGroupIds:
+          - !GetAtt EC2SG.GroupId
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: AppName
+                Value: !Ref AppName
+          - ResourceType: volume
+            Tags:
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: AppName
+                Value: !Ref AppName
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            yum install -y httpd
+            IPV4=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+            echo "<html>" > /var/www/html/index.html
+            echo "<h1>Public IP = $IPV4</h1>" >> /var/www/html/index.html
+            echo "<h1>AppName = ${AppName}</h1>" >> /var/www/html/index.html
+            echo "<h1>Environment = ${Environment}</h1>" >> /var/www/html/index.html
+            echo "<h1>Hostname = $(curl http://169.254.169.254/latest/meta-data/public-hostname)</h1>" >> /var/www/html/index.html
+            echo "</body>" >> /var/www/html/index.html
+            echo "</html>" >> /var/www/html/index.html
+            systemctl restart httpd
+            echo {\"Comment\":\"Update ${AppName} DNS record in ${R53Zone}\",\"Changes\":[{\"Action\":\"UPSERT\",\"ResourceRecordSet\":{\"Name\":\"${AppName}\",\"Type\":\"A\",\"TTL\":\"300\",\"ResourceRecords\":[{\"Value\":\"$(curl http://169.254.169.254/latest/meta-data/public-ipv4)\"}]}}] > /tmp/r53upsert.json
+            aws route53 change-resource-record-sets --hosted-zone-id ${R53Zone} --change-batch file:///tmp/r53upsert.json
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${Environment}-${AppName}-ASG'
+      Cooldown: 30
+      DesiredCapacity: !If [ ASGScaleOut, 2, 1 ]
+      HealthCheckGracePeriod: 10
+      HealthCheckType: EC2
+      LaunchTemplate: 
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !If [ IsRollback, !Ref LaunchTemplateRollbackVersion , !GetAtt LaunchTemplate.LatestVersionNumber ]
+      MaxSize: !If [ ASGScaleOut, 2, 1 ]
+      MetricsCollection: 
+        - Granularity: 1Minute
+      MinSize: 1
+      VPCZoneIdentifier: !Ref SubnetIds
+
+      # Creation policy
+      # Update policy
