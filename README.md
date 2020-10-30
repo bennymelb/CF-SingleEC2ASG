@@ -1,2 +1,2 @@
-# CF-SingleEC2ASG
+# CFN-SingleEC2ASG
 A sample single EC2 with ASG stack
